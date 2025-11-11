@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>고려 고등학교 2-1반의 비밀상담소 (Supabase)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // --- Supabase 클라이언트 임포트 ---
+        import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm';
+
+        // ==========================================================
+        // ✅ Supabase 인증 정보 (사용자님의 키로 업데이트됨)
+        // ==========================================================
+        const SUPABASE_URL = 'https://gbkrllkcukjpywhidblj.supabase.co'; 
+        const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdia3JsbGtjdWtqcHl3aGlkYmxqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjI4MjQ4MjgsImV4cCI6MjA3ODQwMDgyOH0.Z9jhCZ30Vb-rTX_hUL0eiI7qcb2mee3h5qmlfHtSyKw';
+        
+        const TABLE_NAME = 'counseling_messages';
+        const TEACHER_PASSWORD = "21class"; 
+        // ==========================================================
+        
+        // LocalStorage fallback key
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        // ✅ 학생 익명 ID를 저장할 LocalStorage 키
+        const STUDENT_ID_KEY = `student_anonymous_id_${appId}`;
+
+        let supabase = null;
+        let userId; 
+        let isSupabaseActive = false;
+        
+        // --- LocalStorage Mock Database (오프라인 모드 지원) ---
+        function createLocalStorageMock() {
+            const STORAGE_KEY = `counseling_data_${appId}`;
+
+            function getLocalData() {
+                const data = localStorage.getItem(STORAGE_KEY);
+                return data ? JSON.parse(data) : [];
+            }
+
+            function setLocalData(data) {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+            }
+            
+            async function mockInsert(data) {
+                const docId = crypto.randomUUID();
+                const now = new Date();
+                const newData = {
+                    ...data,
+                    id: docId,
+                    created_at: now.toISOString(), 
+                };
+                const allData = getLocalData();
+                allData.push(newData);
+                setLocalData(allData);
+                if (typeof renderApp === 'function') renderApp();
+                return { data: [newData] };
+            }
+            
+            async function mockUpdate(docId, updates) {
+                const allData = getLocalData();
+                const index = allData.findIndex(d => d.id === docId);
+                if (index > -1) {
+                    allData[index] = { ...allData[index], ...updates };
+                    setLocalData(allData);
+                    if (typeof renderApp === 'function') renderApp();
+                }
+                return { error: null };
+            }
+            
+            async function mockSelect(filterFn = null) {
+                 let data = getLocalData();
+                 if (filterFn) {
+                    data = data.filter(filterFn);
+                 }
+                 data.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+                 return { data: data };
+            }
+
+            return {
+                from: () => ({
+                    insert: (data) => mockInsert(data),
+                    update: (updates) => ({ 
+                        eq: (field, value) => ({ execute: () => mockUpdate(value, updates) })
+                    }),
+                    select: (query = '*') => ({
+                        eq: (field, value) => ({ execute: () => mockSelect(d => d[field] === value) }),
+                        order: () => ({ execute: () => mockSelect() }), 
+                        execute: () => mockSelect() 
+                    }),
+                }),
+                channel: (channelName) => ({
+                    on: (event, filter, callback) => ({
+                        subscribe: () => {
+                            return { unsubscribe: () => {} };
+                        }
+                    })
+                })
+            };
+        }
+
+        // --- CSV Export Function ---
+        function exportToCsv(filename, messages) {
+            const header = ["시간", "학생 ID (앞 8자리)", "고민 내용", "선생님 답변", "확인 여부"];
+            
+            const rows = messages.map(msg => [
+                formatTimestamp(msg.created_at, true), 
+                // ✅ studentID로 수정
+                msg.studentID.substring(0, 8), 
+                `"${msg.message.replace(/"/g, '""').replace(/\n/g, ' ')}"`, 
+                `"${msg.reply.replace(/"/g, '""').replace(/\n/g, ' ')}"`,
+                msg.viewed ? "O" : "X"
+            ]);
+
+            const csvContent = [
+                header.join(","),
+                ...rows.map(e => e.join(","))
+            ].join("\n");
+
+            const blob = new Blob(["\ufeff" + csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            if (link.download !== undefined) {
+                const url = URL.createObjectURL(blob);
+                link.setAttribute("href", url);
+                link.setAttribute("download", filename);
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+        }
+
+
+        // --- Tailwind CSS 사용자 정의 설정 (베이지 테마) ---
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'beige-warm': '#FAF8F0', 
+                        'beige-light': '#F5F5DC', 
+                        'brown-dark': '#4A3728', 
+                        'brown-medium': '#79665A', 
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                },
+            }
+        }
+
+        // --- 데이터 및 메시지 ---
+        const encouragingMessages = [
+            "오늘도 힘차게 시작! 너의 하루를 응원해.",
+            "잘하고 있어, 충분히 멋진 하루를 보내고 있다는 걸 잊지 마.",
+            "걱정하지 마. 모든 고민은 성장으로 가는 길목이야.",
+            "숨겨진 너의 잠재력을 믿어. 파이팅!",
+            "잠시 쉬어가도 괜찮아. 너의 속도에 맞춰 걸어가렴.",
+            "2학년 1반, 모두에게 좋은 일이 가득하길 바라!",
+            "선생님은 항상 너희를 지켜보고 있단다. 힘내렴.",
+        ];
+
+        // --- 유틸리티 함수 ---
+        function getDailyMessage() {
+            const today = new Date().toDateString();
+            let seed = 0;
+            for(let i = 0; i < today.length; i++) {
+                seed += today.charCodeAt(i);
+            }
+            const index = seed % encouragingMessages.length;
+            return encouragingMessages[index];
+        }
+
+        function formatTimestamp(timestampString) {
+            if (!timestampString) return '시간 정보 없음';
+            try {
+                const date = new Date(timestampString);
+                return date.toLocaleDateString('ko-KR') + ' ' + date.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+            } catch (e) {
+                console.error("Timestamp format error:", e);
+                return '시간 정보 오류';
+            }
+        }
+
+        // --- Supabase/DB 초기화 ---
+
+        async function initDB() {
+            try {
+                // ✅ LocalStorage에서 기존 userId 로드 또는 새로 생성
+                let storedUserId = localStorage.getItem(STUDENT_ID_KEY);
+                if (!storedUserId) {
+                    storedUserId = crypto.randomUUID();
+                    localStorage.setItem(STUDENT_ID_KEY, storedUserId);
+                }
+                userId = storedUserId;
+                
+                // Supabase 연결 시도
+                if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+                    supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+                        auth: { persistSession: false }, 
+                    });
+                    isSupabaseActive = true; 
+                    
+                    document.getElementById('user-id-display').textContent = `사용자 ID: ${userId.substring(0, 8)}... (Supabase 연결됨)`;
+                }
+                
+                initApp();
+
+            } catch (error) {
+                console.error("DB 초기화 오류:", error);
+                // 오류 발생 시 LocalStorage Mock으로 대체
+                supabase = createLocalStorageMock(); 
+                isSupabaseActive = false;
+                document.getElementById('user-id-display').textContent = `사용자 ID: ${userId.substring(0, 8)}... (DB 연결 오류, 오프라인 모드 활성화)`;
+                initApp();
+            }
+        }
+
+        // --- 학생/교사 모드 전환 ---
+        let currentView = 'student'; 
+        let teacherSubscription = null;
+        let studentSubscription = null;
+
+        function toggleView() {
+            const toggleButton = document.getElementById('view-toggle-button');
+            if (currentView === 'student') {
+                showPasswordModal();
+            } else {
+                currentView = 'student';
+                renderApp();
+                toggleButton.textContent = "교사용 페이지로 전환";
+                toggleButton.classList.remove('bg-red-500');
+                toggleButton.classList.add('bg-brown-medium');
+                // 교사 모드에서 학생 모드로 돌아갈 때 구독 해제
+                if (teacherSubscription) supabase.removeChannel(teacherSubscription);
+                teacherSubscription = null;
+            }
+        }
+        
+        function showPasswordModal() {
+            const modal = document.getElementById('password-modal');
+            const passwordInput = document.getElementById('password-input');
+            passwordInput.value = ''; 
+            modal.classList.remove('hidden');
+            setTimeout(() => {
+                modal.classList.add('opacity-100');
+                passwordInput.focus();
+            }, 10);
+        }
+
+        function handlePasswordCheck() {
+            const passwordInput = document.getElementById('password-input');
+            const password = passwordInput.value;
+            const modal = document.getElementById('password-modal');
+
+            if (password === TEACHER_PASSWORD) {
+                currentView = 'teacher';
+                renderApp();
+                const toggleButton = document.getElementById('view-toggle-button');
+                toggleButton.textContent = "학생 모드로 돌아가기";
+                toggleButton.classList.remove('bg-brown-medium');
+                toggleButton.classList.add('bg-red-500');
+                
+                modal.classList.remove('opacity-100');
+                setTimeout(() => {
+                    modal.classList.add('hidden');
+                }, 300);
+
+            } else {
+                modal.classList.remove('opacity-100');
+                setTimeout(() => {
+                    modal.classList.add('hidden');
+                    showModal('비밀번호가 올바르지 않습니다.');
+                }, 300);
+            }
+        }
+
+        // --- 학생 페이지 기능 ---
+
+        async function handleStudentSubmit(event) {
+            event.preventDefault();
+            const messageInput = document.getElementById('student-message-input');
+            const message = messageInput.value.trim();
+
+            if (!message) {
+                showModal("고민 내용을 작성해주세요.");
+                return;
+            }
+            
+            if (!supabase) {
+                showModal("데이터베이스 기능이 비활성화되어 고민을 저장할 수 없습니다.");
+                return;
+            }
+
+            try {
+                // Supabase insert (오프라인/Mock 모드도 이 경로를 사용)
+                const { error } = await supabase
+                    .from(TABLE_NAME)
+                    .insert([
+                        { 
+                            // ✅ studentID로 수정
+                            studentID: userId,
+                            message: message,
+                            reply: '', 
+                            viewed: false 
+                        }
+                    ]);
+                    
+                if (error) throw error;
+
+                messageInput.value = '';
+                showModal("고민이 선생님에게 무사히 전달되었습니다! 감사합니다.");
+            } catch (e) {
+                console.error("고민 추가 중 오류 발생: ", e);
+                showModal("고민 전송 중 오류가 발생했습니다: " + e.message);
+            }
+        }
+
+        // --- 교사 페이지 기능 ---
+
+        // ✅ 뷰(viewed) 상태 토글 핸들러 추가
+        async function handleViewedToggle(docId, isChecked) {
+            if (!supabase) {
+                showModal("데이터베이스 기능이 비활성화되어 상태를 업데이트할 수 없습니다.");
+                return;
+            }
+
+            try {
+                const { error } = await supabase
+                    .from(TABLE_NAME)
+                    .update({
+                        viewed: isChecked
+                    })
+                    .eq('id', docId);
+
+                if (error) throw error;
+                // 메시지 토글 성공 시 알림은 생략하고 실시간 업데이트에 맡깁니다.
+
+            } catch (e) {
+                console.error("확인 상태 업데이트 중 오류 발생: ", e);
+                showModal("확인 상태 업데이트 중 오류가 발생했습니다: " + e.message);
+            }
+        }
+
+        // CSV 다운로드 버튼 클릭 핸들러
+        async function handleExportToCsv() {
+            if (!supabase || !isSupabaseActive) {
+                showModal("데이터베이스에 연결되지 않아 다운로드할 수 없습니다.");
+                return;
+            }
+            
+            try {
+                // Supabase에서 모든 데이터를 불러옵니다. created_at 내림차순 정렬
+                const { data, error } = await supabase
+                    .from(TABLE_NAME)
+                    .select('*')
+                    .order('created_at', { ascending: false }); 
+
+                if (error) throw error;
+                
+                const filename = `고려고_2-1반_비밀상담소_데이터_${new Date().toISOString().slice(0, 10)}.csv`;
+                exportToCsv(filename, data || []);
+                
+                showModal("CSV 파일 다운로드를 시작합니다.");
+
+            } catch (e) {
+                console.error("CSV 다운로드 중 오류 발생:", e);
+                showModal("데이터 다운로드 중 오류가 발생했습니다: " + e.message);
+            }
+        }
+        
+        function renderTeacherView() {
+            const appContainer = document.getElementById('app-content');
+            
+            // 기존 구독 해제 및 채널 제거
+            if (teacherSubscription) supabase.removeChannel(teacherSubscription);
+
+            if (!supabase || !isSupabaseActive) {
+                 appContainer.innerHTML = `
+                    <p class="text-red-600 p-8 text-center bg-white rounded-xl shadow-xl">
+                        데이터베이스에 연결되지 않아 학생들의 고민을 볼 수 없습니다. (오프라인 모드)
+                    </p>
+                 `;
+                 return;
+            }
+
+            appContainer.innerHTML = `
+                <div class="space-y-6">
+                    <div class="flex justify-between items-center border-b pb-2">
+                        <h2 class="text-2xl font-bold text-brown-dark">학생들의 고민 확인 및 답변</h2>
+                        <button id="export-csv-button" class="bg-green-600 text-white py-2 px-4 rounded-lg text-sm hover:bg-green-700 transition duration-200 shadow-md">
+                            모든 고민 CSV로 다운로드
+                        </button>
+                    </div>
+                    <div id="messages-list" class="space-y-4">
+                        <p class="text-brown-medium">메시지를 불러오는 중...</p>
+                    </div>
+                </div>
+            `;
+            
+            document.getElementById('export-csv-button').addEventListener('click', handleExportToCsv);
+            const messagesList = document.getElementById('messages-list');
+            
+            // 데이터 렌더링 함수
+            const renderTeacherMessages = async () => {
+                 const { data: allMessages, error } = await supabase
+                    .from(TABLE_NAME)
+                    .select('*')
+                    .order('created_at', { ascending: false });
+
+                if (error) {
+                    console.error("Supabase data fetch error:", error);
+                    messagesList.innerHTML = `<p class="text-red-600">데이터를 불러오는 중 오류 발생: ${error.message}</p>`;
+                    return;
+                }
+
+                messagesList.innerHTML = '';
+                
+                if (!allMessages || allMessages.length === 0) {
+                    messagesList.innerHTML = `<p class="text-brown-medium p-4 bg-beige-light rounded-lg shadow-inner">아직 접수된 고민이 없습니다. 평화로운 2-1반이네요!</p>`;
+                    return;
+                }
+                
+                allMessages.forEach((data) => {
+                    const docId = data.id;
+                    const timeString = formatTimestamp(data.created_at);
+                    const isReplied = !!data.reply;
+                    const isViewed = data.viewed;
+
+                    const messageElement = document.createElement('div');
+                    messageElement.className = 'bg-white p-4 rounded-xl shadow-lg border border-beige-light';
+                    messageElement.innerHTML = `
+                        <div class="flex justify-between items-start mb-2">
+                            <p class="text-xs text-gray-500">
+                                <span class="font-bold text-brown-dark">${data.studentID.substring(0, 8)}...</span> 학생 | 
+                                ${timeString}
+                            </p>
+                            <!-- ✅ 확인 상태 토글 버튼 추가 -->
+                            <label class="flex items-center space-x-1 cursor-pointer">
+                                <input type="checkbox" data-doc-id="${docId}" ${isViewed ? 'checked' : ''} class="viewed-toggle form-checkbox h-4 w-4 ${isViewed ? 'text-green-600' : 'text-gray-400'} rounded border-gray-300 transition duration-150">
+                                <span class="text-xs ${isViewed ? 'text-green-600 font-semibold' : 'text-gray-600'}">${isViewed ? '확인됨' : '미확인'}</span>
+                            </label>
+                            <!-- ---------------------------- -->
+                        </div>
+
+                        <div class="bg-beige-warm p-3 rounded-lg mb-3">
+                            <p class="text-brown-dark font-medium whitespace-pre-wrap">
+                                Q: ${data.message}
+                            </p>
+                        </div>
+
+                        ${isReplied ? `
+                            <div class="border-t pt-3 mt-3">
+                                <p class="text-sm font-bold text-green-600 mb-1">선생님 답변:</p>
+                                <p class="text-brown-medium whitespace-pre-wrap">${data.reply}</p>
+                            </div>
+                        ` : `
+                            <div class="border-t pt-3 mt-3">
+                                <textarea id="reply-input-${docId}" rows="3" class="w-full p-2 border rounded-lg focus:ring-brown-medium focus:border-brown-medium resize-none" placeholder="여기에 답변을 작성해주세요..."></textarea>
+                                <button data-doc-id="${docId}" class="reply-button mt-2 w-full bg-brown-medium text-white py-2 rounded-lg hover:bg-brown-dark transition duration-200 shadow-md">
+                                    답변 완료
+                                </button>
+                            </div>
+                        `}
+                    `;
+                    messagesList.appendChild(messageElement);
+                });
+
+                // 답변 버튼 이벤트 리스너 설정
+                messagesList.querySelectorAll('.reply-button').forEach(button => {
+                    button.addEventListener('click', (e) => {
+                        const docId = e.target.dataset.docId;
+                        const replyInput = document.getElementById(`reply-input-${docId}`);
+                        handleTeacherReply(docId, replyInput.value);
+                    });
+                });
+
+                // ✅ 확인 상태 토글 이벤트 리스너 설정
+                messagesList.querySelectorAll('.viewed-toggle').forEach(checkbox => {
+                    checkbox.addEventListener('change', (e) => {
+                        const docId = e.target.dataset.docId;
+                        handleViewedToggle(docId, e.target.checked);
+                    });
+                });
+            };
+            
+            // 최초 데이터 로드
+            renderTeacherMessages();
+            
+            // Supabase Realtime Subscription 설정 (Channel 사용)
+            const teacherChannel = supabase.channel('teacher_all_messages_channel');
+
+            teacherSubscription = teacherChannel
+                .on(
+                    'postgres_changes', 
+                    { event: '*', schema: 'public', table: TABLE_NAME },
+                    (payload) => {
+                        console.log('Realtime change for teacher:', payload);
+                        renderTeacherMessages();
+                    }
+                )
+                .subscribe(); // 구독 시작
+        }
+
+        async function handleTeacherReply(docId, replyText) {
+            const reply = replyText.trim();
+            if (!reply) {
+                showModal("답변 내용을 작성해주세요.");
+                return;
+            }
+            
+            if (!supabase) {
+                showModal("데이터베이스 기능이 비활성화되어 답변을 등록할 수 없습니다.");
+                return;
+            }
+
+            try {
+                // Supabase update by ID (primary key)
+                const { error } = await supabase
+                    .from(TABLE_NAME)
+                    .update({
+                        reply: reply,
+                        viewed: true // 답변하면 무조건 확인됨으로 처리
+                    })
+                    .eq('id', docId); 
+
+                if (error) throw error;
+
+                showModal("답변이 성공적으로 등록되었습니다!");
+            } catch (e) {
+                console.error("답변 등록 중 오류 발생: ", e);
+                showModal("답변 등록 중 오류가 발생했습니다: " + e.message);
+            }
+        }
+
+        // --- 메인 렌더링 함수 ---
+        function renderApp() {
+            const appContent = document.getElementById('app-content');
+            if (!appContent) return;
+            
+            // 학생 모드로 전환 시 교사 구독 해제
+            if (currentView === 'student' && teacherSubscription) {
+                supabase.removeChannel(teacherSubscription);
+                teacherSubscription = null;
+            }
+            
+            if (currentView === 'student') {
+                const dailyMessage = getDailyMessage();
+                appContent.innerHTML = `
+                    <div class="space-y-8">
+                        <!-- 오늘의 응원 메시지 -->
+                        <div class="bg-beige-light p-6 rounded-xl shadow-inner border-2 border-beige-warm">
+                            <p class="text-sm font-bold text-brown-dark mb-2">💌 오늘의 선생님 메시지:</p>
+                            <p class="text-lg text-brown-medium font-semibold">${dailyMessage}</p>
+                        </div>
+                        
+                        <!-- 고민 작성 폼 -->
+                        <div class="bg-white p-6 rounded-xl shadow-2xl">
+                            <h2 class="text-xl font-bold text-brown-dark mb-4 border-b pb-2">나만의 비밀 고민 작성하기</h2>
+                            <form id="student-submit-form">
+                                <textarea id="student-message-input" rows="8" class="w-full p-4 border border-beige-medium rounded-lg focus:ring-brown-medium focus:border-brown-medium transition duration-200 resize-none" placeholder="선생님께 털어놓고 싶은 고민을 익명으로 작성해주세요. (언제든지 괜찮습니다!)"></textarea>
+                                <button type="submit" class="mt-4 w-full bg-brown-medium text-white font-bold py-3 rounded-xl hover:bg-brown-dark transition duration-300 shadow-lg">
+                                    선생님께 익명으로 전송하기
+                                </button>
+                            </form>
+                            <p class="text-xs text-gray-400 mt-3 text-center">
+                                * 작성된 내용은 2-1반 선생님만 확인하고 답장할 수 있습니다.
+                            </p>
+                        </div>
+
+                        <!-- 내 고민 확인하기 (선택 사항) -->
+                        <div class="bg-white p-6 rounded-xl shadow-xl">
+                            <h3 class="text-xl font-bold text-brown-dark mb-4 border-b pb-2">내가 보낸 고민과 답변 확인</h3>
+                            <div id="my-messages-list" class="space-y-3">
+                                <p class="text-brown-medium">메시지를 불러오는 중...</p>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                document.getElementById('student-submit-form').addEventListener('submit', handleStudentSubmit);
+                loadMyMessages();
+
+            } else {
+                renderTeacherView();
+            }
+        }
+        
+        function loadMyMessages() {
+            const myMessagesList = document.getElementById('my-messages-list');
+            
+            // 기존 구독 해제 및 채널 제거
+            if (studentSubscription) supabase.removeChannel(studentSubscription);
+
+            if (!supabase || !isSupabaseActive) {
+                myMessagesList.innerHTML = `<p class="text-red-600 text-center p-2">데이터베이스에 연결되지 않아 나의 고민을 확인할 수 없습니다. (오프라인 모드)</p>`;
+                return;
+            }
+            
+            // 데이터 렌더링 함수
+            const renderStudentMessages = async () => {
+                const { data: myMessages, error } = await supabase
+                    .from(TABLE_NAME)
+                    .select('*')
+                    // ✅ studentID로 수정
+                    .eq('studentID', userId) 
+                    .order('created_at', { ascending: false });
+
+                if (error) {
+                    console.error("Supabase student data fetch error:", error);
+                    myMessagesList.innerHTML = `<p class="text-red-600 text-center p-2 font-bold">데이터를 불러오는 중 오류 발생: ${error.message}</p>`;
+                    return;
+                }
+                
+                myMessagesList.innerHTML = '';
+                
+                if (!myMessages || myMessages.length === 0) {
+                    myMessagesList.innerHTML = `<p class="text-brown-medium text-center p-2">아직 보낸 고민이 없습니다.</p>`;
+                    return;
+                }
+
+                myMessages.forEach((data) => {
+                    const timeString = formatTimestamp(data.created_at);
+
+                    const messageElement = document.createElement('div');
+                    messageElement.innerHTML = `
+                        <details class="border border-beige-light p-3 rounded-lg shadow-sm cursor-pointer hover:shadow-md transition duration-200">
+                            <summary class="list-none flex justify-between items-center text-brown-dark font-medium p-1 -m-1">
+                                <span class="${data.reply ? 'text-green-600' : 'text-yellow-600'} flex items-center">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 mr-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="${data.reply ? 'M22 11.08V12a10 10 0 1 1-5.93-9.14' : 'M12 2v10'}"/>
+                                        <path d="${data.reply ? 'M22 4L12 14l-3-3' : 'M12 22v-4'}"/>
+                                    </svg>
+                                    ${data.reply ? '답변 완료' : '답변 대기 중'}
+                                </span>
+                                <span class="text-xs text-gray-500">${timeString}</span>
+                            </summary>
+                            
+                            <!-- Detail Content -->
+                            <div class="mt-3 pt-3 border-t border-beige-light space-y-3">
+                                <p class="text-sm font-bold text-brown-dark">나의 고민:</p>
+                                <div class="bg-beige-warm p-3 rounded-lg whitespace-pre-wrap text-brown-medium border border-gray-200">
+                                    ${data.message}
+                                </div>
+                                
+                                ${data.reply ? `
+                                    <p class="text-sm font-bold text-green-700">선생님 답변:</p>
+                                    <div class="p-3 bg-green-50 rounded-md border border-green-200 whitespace-pre-wrap text-brown-medium">
+                                        ${data.reply}
+                                    </div>
+                                ` : `
+                                    <p class="text-sm text-yellow-600 font-semibold mt-2 p-2 bg-yellow-50 rounded-md border border-yellow-200">
+                                        선생님의 따뜻한 답변을 기다려주세요.
+                                    </p>
+                                `}
+                            </div>
+                        </details>
+                    `;
+                    myMessagesList.appendChild(messageElement);
+                });
+            };
+
+            // 최초 데이터 로드
+            renderStudentMessages();
+
+            // Supabase Realtime Subscription 설정 (Channel 사용)
+            const studentChannel = supabase.channel(`student_message_${userId}`); 
+
+            studentSubscription = studentChannel
+                .on(
+                    'postgres_changes', 
+                    { event: '*', schema: 'public', table: TABLE_NAME },
+                    (payload) => {
+                        console.log('Realtime change for student:', payload);
+                        renderStudentMessages();
+                    }
+                )
+                .subscribe(); // 구독 시작
+        }
+
+
+        // --- 커스텀 모달 (Alert 대체) ---
+        function showModal(message) {
+            const modal = document.getElementById('custom-modal');
+            document.getElementById('modal-message').textContent = message;
+            modal.classList.remove('hidden');
+            setTimeout(() => {
+                modal.classList.add('opacity-100');
+            }, 10);
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('custom-modal');
+            modal.classList.remove('opacity-100');
+            setTimeout(() => {
+                modal.classList.add('hidden');
+            }, 300);
+        }
+        
+        // --- 앱 시작 ---
+        function initApp() {
+            // 이벤트 리스너 연결
+            document.getElementById('view-toggle-button').addEventListener('click', toggleView);
+            document.getElementById('close-modal-button').addEventListener('click', closeModal);
+            document.getElementById('password-check-button').addEventListener('click', handlePasswordCheck);
+            
+            // Enter 키 입력 시 비밀번호 체크
+            document.getElementById('password-input').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handlePasswordCheck();
+                }
+            });
+            
+            renderApp(); // 초기 렌더링
+        }
+
+        window.onload = initDB; 
+    </script>
+</head>
+
+<body class="bg-beige-warm min-h-screen font-sans flex flex-col items-center p-4">
+    
+    <!-- Custom Alert Modal Structure -->
+    <div id="custom-modal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden transition-opacity duration-300 opacity-0">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full transform transition duration-300">
+            <h3 class="text-xl font-bold text-brown-dark mb-4">알림</h3>
+            <p id="modal-message" class="text-brown-medium mb-6"></p>
+            <button id="close-modal-button" class="w-full bg-brown-medium text-white py-2 rounded-lg hover:bg-brown-dark transition duration-200">
+                확인
+            </button>
+        </div>
+    </div>
+
+    <!-- Custom Password Input Modal Structure (New) -->
+    <div id="password-modal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden transition-opacity duration-300 opacity-0">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full transform transition duration-300">
+            <h3 class="text-xl font-bold text-brown-dark mb-4">교사 인증</h3>
+            <p class="text-brown-medium mb-4">교사용 페이지로 전환하려면 비밀번호를 입력해주세요.</p>
+            <input type="password" id="password-input" class="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:ring-brown-medium focus:border-brown-medium" placeholder="비밀번호 입력">
+            <button id="password-check-button" class="w-full bg-brown-medium text-white py-2 rounded-lg hover:bg-brown-dark transition duration-200 font-semibold">
+                인증하기
+            </button>
+        </div>
+    </div>
+    
+    <!-- Header -->
+    <header class="w-full max-w-3xl mb-8 text-center">
+        <h1 class="text-4xl font-extrabold text-brown-dark mb-2 leading-tight">
+            고려 고등학교 2-1반의 비밀상담소 
+            <svg xmlns="http://www.w3.org/2000/svg" class="inline-block w-8 h-8 text-brown-medium ml-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 17H2V5h10v2h10z"/><path d="M7 9h6"/><path d="M7 13h4"/>
+            </svg>
+        </h1>
+        <p id="user-id-display" class="text-xs text-gray-500 mt-2"></p>
+        
+        <div class="flex justify-center mt-4 space-x-4">
+            <button id="view-toggle-button" class="bg-brown-medium text-white py-2 px-4 rounded-lg shadow-md hover:bg-brown-dark transition duration-300 font-semibold">
+                교사용 페이지로 전환
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main id="app-container" class="w-full max-w-3xl">
+        <div id="app-content">
+            <!-- Content will be rendered here by JavaScript -->
+            <p class="text-center text-brown-medium p-8">페이지를 불러오는 중...</p>
+        </div>
+    </main>
+
+    <!-- Footer for aesthetic spacing -->
+    <footer class="mt-12 text-xs text-gray-400">
+        &copy; 2025 2-1 Class Counseling
+    </footer>
+</body>
+</html>
